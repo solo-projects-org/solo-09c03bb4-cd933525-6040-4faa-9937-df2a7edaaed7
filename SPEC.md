@@ -54,46 +54,81 @@
 5. **缺桶不能当零**：实例上报必须自洽（`total_count == sum(bucket_counts)`，且桶数等于
    边界数 + 1），否则 422 拒收。合并时**只合并已收齐实例**，绝不把缺失实例视为零计数。
 
-## 4. 发布与截止时刻
+## 4. p95 目标版本登记
+
+- **登记主体**：性能数据员按**服务**登记 p95 目标版本，每版包含版本号 `version`、
+  目标值 `p95_target_us`（微秒，非负）与 UTC 生效时刻 `effective_at`（带时区，落库归一化为 UTC）。
+- 登记键为 `(service, version)`。登记成功的版本**不可修改、不提供删除接口**：
+  - **原样重传**：同键且规范指纹（目标值、生效时刻）完全一致 → 返回 `200`，
+    `duplicate=true`，返回原版本记录，不新增、不改写。
+  - **异文重传**：同键但目标值或生效时刻不同 → `409 Conflict`，拒收，原版本保持不变；
+    调整目标必须使用新的版本号。
+  - 不同服务可使用相同版本号，互不影响。
+
+## 5. 发布与截止时刻
 
 - **截止时刻 (deadline)**：发布方给出的 UTC 时刻。
-- 发布逻辑：对给定 `(service, window)`，只纳入 `received_at <= deadline` 的实例上报。
+- **p95 目标不再由发布请求传入**（请求体携带 `p95_target_us` 将被 `422` 拒收）。
+  发布时从该服务**评审提交时已登记**、且 `effective_at <= window_end`
+  （窗口结束时刻含）的目标版本中选取**最后生效的一版**：
+  - 先按 `effective_at` 取最新；同一生效时刻存在多版时，取最近登记（`id` 最大）的一版，
+    保证选择结果确定且可复现。
+  - 窗口结束之后才生效的版本不参与本次发布。
+  - 没有任何符合条件的版本 → `409 Conflict`（`no_eligible_p95_target_version`），
+    **拒绝发布，不生成发布记录、不占用发布编号**（序号递增与结果写入在同一事务内，
+    选不到版本时事务回滚）。
+- **发布逻辑**：对给定 `(service, window)`，只纳入 `received_at <= deadline` 的实例上报。
+  目标版本的选取与上报读取在同一个 `BEGIN IMMEDIATE` 事务内完成。
 - `expected_instances` 中在截止时刻前没有有效上报的实例列入 `missing_instances`，
   结果状态为**待核 (pending_review)**。`unexpected_instances`（不在应到清单内）单独列出、
   不参与合并；`excluded_late_instances`（截止后才收到）单独列出、不参与本次发布。
 - 状态判定（`p95_evaluation.interval_status` 记录仅按区间的原始判定）：
   - `missing_instances` 非空 → 整体 `pending_review`（待核）。
-  - 否则按 p95 闭区间与目标比较：`p95.upper_us <= target` → `meets`（达标）；
+  - 否则按 p95 闭区间与**所选版本的目标**比较：`p95.upper_us <= target` → `meets`（达标）；
     `p95.lower_us > target` → `misses`（未达标）；
     目标落在 `[lower_us, upper_us]` 内、或 `upper_us == null` → `pending_review`（待核）。
   - 无任何数据（`C == 0`）→ `pending_review`。
+- **目标与结论随版本号一起固化**：发布快照包含 `p95_target_version`、
+  `p95_target_us` 与 `p95_target`（版本号、目标值、生效时刻、登记时刻、选用口径），
+  以及带 `target_us` 的 `p95_evaluation`。之后只能按 `publish_id` 回查当时所用版本与达标结论，
+  后续登记新版本不改变历史快照。
 - 已发布结果**不可变**，持久化到 `publishes`，带自增批号 `publish_id`
   （全局单调，用 `seq` 表在同一事务内分配），可用 `GET /api/v1/published/{publish_id}` 回查。
 
 
-## 5. 接口
+## 6. 接口
 
 - `POST /api/v1/reports`：接收实例上报。`201` 新建；`200` 幂等重传；`409` 异文冲突；`422` 校验失败。
-- `POST /api/v1/publish`：按截止时刻发布窗口统计。`201`。
-- `GET /api/v1/published/{publish_id}`：按编号回查已发布结果。
-- `GET /api/v1/published`：列出已发布结果（按编号倒序，支持 `limit`）。
+- `POST /api/v1/p95-targets`：登记 p95 目标版本。`201` 新登记；`200` 同版本原样重传
+  （`duplicate=true`，返回原版本）；`409` 同版本内容有变；`422` 校验失败。
+- `GET /api/v1/p95-targets`：查询已登记目标版本（可按 `service` 过滤，按登记顺序倒序，支持 `limit`）。
+- `POST /api/v1/publish`：按截止时刻发布窗口统计（目标版本自动选取）。`201`；
+  `409` 窗口结束前无已生效的目标版本（拒绝且不生成发布记录）；`422` 校验失败。
+- `GET /api/v1/published/{publish_id}`：按编号回查已发布结果（含当时采用的目标版本与结论）。
+- `GET /api/v1/published`：列出已发布结果（按编号倒序，支持 `limit`，含 `p95_target_version`）。
 - `GET /api/v1/reports`：按服务/窗口/批次查询已收上报（运维排查用）。
 - `GET /healthz`：存活探针。
 - `GET /docs`：Swagger UI；`GET /openapi.json`：OpenAPI 文档。
 
-## 6. 数据库
+## 7. 数据库
 
 SQLite（WAL 模式），表：
 
 - `reports`：一跳上报记录，含规范指纹、接收时间、来源批号、边界与计数（JSON）。
   唯一索引 `(service, instance, window_start, window_end)` 保证幂等键。
-- `publishes`：已发布结果快照（JSON 结果体）。
+- `p95_targets`：p95 目标版本登记，含目标值、UTC 生效时刻、登记时刻、规范指纹。
+  唯一索引 `(service, version)` 保证版本不可变；索引 `(service, effective_at, id)`
+  支撑发布时的"最后生效版本"选取。
+- `publishes`：已发布结果快照（JSON 结果体，内含目标版本号与达标结论）。
 - `seq`：全局发布序号。
 
 Docker Compose 中与 API 同一镜像启动，数据卷挂载 `/data`。
 
-## 7. 测试口径
+## 8. 测试口径
 
 - 单测覆盖：桶重映射、分位数区间、缺实例待核、达标/未达标、边界模糊待核、
   幂等重传、异文冲突、迟到实例新批次与旧批号回查。
-- 端到端：用 `TestClient` 跑完整流程。
+- 目标版本：登记成功、原样重传返回原版本、异文 409 且原版本不变、
+  生效时刻边界（恰在窗口结束时刻可选用、之后不可选用）、同时刻取最近登记、
+  无符合版本拒绝发布且不占用编号、目标登记与发布交错时各次发布快照的版本固化。
+- 端到端：用 `TestClient` 跑完整流程；`scripts/selfcheck.py` 对真实 uvicorn 进程跑登记与发布交错流程。

@@ -16,6 +16,8 @@ from .config import Settings, settings
 from .models import (
     ErrorDetail,
     HealthOut,
+    P95TargetIn,
+    P95TargetOut,
     PublishIn,
     PublishListEntry,
     PublishResult,
@@ -23,8 +25,15 @@ from .models import (
     ReportIn,
     ReportOut,
 )
-from .service import ReportConflict, ingest_report, publish
-from .store import ReportRow, Store
+from .service import (
+    NoEligibleTarget,
+    ReportConflict,
+    TargetConflict,
+    ingest_report,
+    publish,
+    register_p95_target,
+)
+from .store import ReportRow, Store, TargetRow
 
 logger = logging.getLogger("slo_api")
 
@@ -38,12 +47,18 @@ DESCRIPTION = """
   `total_count == sum(bucket_counts)`——**缺桶不能当零**。
 - 同一 `(service, instance, window)` 原样重传只收一次（`200`, `duplicate=true`）；
   内容不同则 `409` 拒收，原记录不变。
+- **p95 目标由性能数据员按服务登记版本**（`POST /api/v1/p95-targets`）：
+  每版带版本号与 UTC 生效时刻；登记成功的版本不可修改，同版本原样重传返回原版本、
+  内容有变返回 `409`。
+- 发布请求**不再接受 p95 目标入参**：系统从评审提交时已登记、且在窗口结束
+  （含）前生效的版本中选出**最后生效的一版**（生效时刻最新；同时刻取最近登记）。
+  没有符合条件的版本时拒绝发布（`409`），**不生成发布记录**。
 - 发布按 `deadline` 只纳入 `received_at <= deadline` 的上报；未收齐的应到实例
   列入 `missing_instances`，整体状态为**待核**。缺失实例绝不按零参与合并。
 - 合并时按所有实例桶边界的并集计算合并 CDF 的必含上下界；跨实例的桶不会被劈开，
   `p50/p95/p99` 返回**必含闭区间** `[lower_us, upper_us]`（`upper_us=null` 表示落在无上界溢出桶）。
 - p95 目标判定：区间上界 ≤ 目标为**达标**；区间下界 > 目标为**未达标**；
-  目标落在区间内或区间无上界为**待核**。
+  目标落在区间内或区间无上界为**待核**。所用目标版本号、目标值与达标结论随发布快照持久化。
 - 发布结果不可变，带全局递增 `publish_id`，可随时按编号回查；迟到实例进入新批次。
 """
 
@@ -71,6 +86,7 @@ def create_app(app_settings: Settings | None = None, store: Store | None = None)
         contact={"name": "Performance Data Team"},
         openapi_tags=[
             {"name": "reports", "description": "实例上报接收"},
+            {"name": "p95-targets", "description": "p95 目标版本登记与查询"},
             {"name": "publish", "description": "按截止时刻发布与回查"},
             {"name": "ops", "description": "运维与探针"},
         ],
@@ -117,6 +133,36 @@ def create_app(app_settings: Settings | None = None, store: Store | None = None)
                 ),
                 existing_source_batch=existing.source_batch,
                 existing_fingerprint=existing.fingerprint,
+            ).model_dump(),
+        )
+
+    @app.exception_handler(TargetConflict)
+    async def _target_conflict_handler(_: Request, exc: TargetConflict) -> JSONResponse:
+        existing = exc.existing
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=ErrorDetail(
+                error="conflicting_p95_target_version",
+                detail=(
+                    f"服务 {existing.service} 的目标版本 {existing.version} 已登记且不可修改；"
+                    f"本次提交的目标值或生效时刻与原登记不一致，已拒收，原版本保持不变。"
+                    f"如需调整请使用新的版本号。"
+                ),
+                existing_fingerprint=existing.fingerprint,
+            ).model_dump(),
+        )
+
+    @app.exception_handler(NoEligibleTarget)
+    async def _no_eligible_target_handler(_: Request, exc: NoEligibleTarget) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=ErrorDetail(
+                error="no_eligible_p95_target_version",
+                detail=(
+                    f"服务 {exc.service} 在窗口结束时刻 {exc.window_end}（含）之前"
+                    "没有任何已登记且生效的 p95 目标版本，拒绝发布，未生成发布记录。"
+                    "请先调用 POST /api/v1/p95-targets 登记目标版本。"
+                ),
             ).model_dump(),
         )
 
@@ -174,13 +220,61 @@ def create_app(app_settings: Settings | None = None, store: Store | None = None)
             received_at=row.received_at,
         )
 
+    def _target_out(row: TargetRow, duplicate: bool = False) -> P95TargetOut:
+        return P95TargetOut(
+            target_id=row.id,
+            duplicate=duplicate,
+            service=row.service,
+            version=row.version,
+            p95_target_us=row.p95_target_us,
+            effective_at=row.effective_at,
+            registered_at=row.registered_at,
+            fingerprint=row.fingerprint,
+        )
+
+    @app.post(
+        "/api/v1/p95-targets",
+        response_model=P95TargetOut,
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            200: {"model": P95TargetOut, "description": "同版本原样重传，返回原版本"},
+            409: {"model": ErrorDetail, "description": "同版本内容有变，拒收且原版本不变"},
+            422: {"model": ErrorDetail, "description": "校验失败"},
+        },
+        tags=["p95-targets"],
+        summary="登记一版 p95 目标（按服务，带版本号与 UTC 生效时刻；登记后不可修改）",
+    )
+    def submit_p95_target(
+        payload: P95TargetIn, response: Response, db: Store = Depends(get_store)
+    ) -> P95TargetOut:
+        row, outcome = register_p95_target(db, payload)
+        if outcome == "duplicate":
+            response.status_code = status.HTTP_200_OK
+        return _target_out(row, duplicate=outcome == "duplicate")
+
+    @app.get(
+        "/api/v1/p95-targets",
+        response_model=list[P95TargetOut],
+        tags=["p95-targets"],
+        summary="查询已登记的 p95 目标版本（可按服务过滤，按登记顺序倒序）",
+    )
+    def list_p95_targets(
+        service: str | None = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+        db: Store = Depends(get_store),
+    ) -> list[P95TargetOut]:
+        return [_target_out(row) for row in db.list_p95_targets(service=service, limit=limit)]
+
     @app.post(
         "/api/v1/publish",
         response_model=PublishResult,
         status_code=status.HTTP_201_CREATED,
-        responses={422: {"model": ErrorDetail}},
+        responses={
+            409: {"model": ErrorDetail, "description": "窗口结束前无已生效的目标版本，拒绝发布"},
+            422: {"model": ErrorDetail, "description": "校验失败"},
+        },
         tags=["publish"],
-        summary="按截止时刻发布窗口 SLO 结果（不可变快照）",
+        summary="按截止时刻发布窗口 SLO 结果（目标版本自动选取，快照不可变）",
     )
     def publish_window(payload: PublishIn, db: Store = Depends(get_store)) -> PublishResult:
         result = publish(db, payload)

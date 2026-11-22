@@ -11,6 +11,7 @@ from .aggregate import (
     STATUS_LABELS,
     HistogramInput,
     ValidationProblem,
+    canonical_number,
     compute_fingerprint,
     display_number,
     evaluate_p95,
@@ -20,14 +21,55 @@ from .aggregate import (
     to_utc_iso,
     validate_histogram,
 )
-from .models import PublishIn, ReportIn
-from .store import ReportRow, Store
+from .models import PublishIn, P95TargetIn, ReportIn
+from .store import ReportRow, Store, TargetRow
 
 
 class ReportConflict(Exception):
     def __init__(self, existing: ReportRow):
         super().__init__("conflicting report")
         self.existing = existing
+
+
+class TargetConflict(Exception):
+    def __init__(self, existing: TargetRow):
+        super().__init__("conflicting p95 target version")
+        self.existing = existing
+
+
+class NoEligibleTarget(Exception):
+    """No registered p95 target version is in force at the window end."""
+
+    def __init__(self, service: str, window_end: str):
+        super().__init__("no eligible p95 target version")
+        self.service = service
+        self.window_end = window_end
+
+
+def register_p95_target(store: Store, request: P95TargetIn) -> tuple[TargetRow, str]:
+    """Register an immutable p95 target version for a service."""
+    if not math.isfinite(request.p95_target_us):
+        raise ValidationProblem("p95_target_us 必须是有限数值")
+    effective_at = to_utc_iso(request.effective_at)
+    registered_at = to_utc_iso(clock.now())
+    payload = {
+        "service": request.service,
+        "version": request.version,
+        "p95_target_us": canonical_number(request.p95_target_us),
+        "effective_at": effective_at,
+    }
+    values = {
+        "service": request.service,
+        "version": request.version,
+        "p95_target_us": float(request.p95_target_us),
+        "effective_at": effective_at,
+        "registered_at": registered_at,
+        "fingerprint": compute_fingerprint(payload),
+    }
+    row, outcome = store.record_p95_target(values)
+    if outcome == "conflict":
+        raise TargetConflict(row)
+    return row, outcome
 
 
 def _normalized_report(report: ReportIn) -> dict[str, Any]:
@@ -105,12 +147,13 @@ def _build_result(
     window_end: str,
     deadline: str,
     expected: list[str],
-    p95_target_us: float | None,
+    target: TargetRow,
     eligible: list[ReportRow],
     all_in_window: list[ReportRow],
     publish_id: int,
     created_at: str,
 ) -> dict[str, Any]:
+    p95_target_us = target.p95_target_us
     expected_set = set(expected)
     by_instance = {row.instance: row for row in eligible}
     reported = sorted(by_instance)
@@ -189,9 +232,18 @@ def _build_result(
         "p50": quantiles["p50"],
         "p95": quantiles["p95"],
         "p99": quantiles["p99"],
-        "p95_target_us": (
-            None if p95_target_us is None else display_number(float(p95_target_us))
-        ),
+        "p95_target_us": display_number(float(p95_target_us)),
+        "p95_target_version": target.version,
+        "p95_target": {
+            "version": target.version,
+            "p95_target_us": display_number(float(target.p95_target_us)),
+            "effective_at": target.effective_at,
+            "registered_at": target.registered_at,
+            "selection_basis": (
+                f"在窗口结束 {window_end}（含）前生效的已登记版本中，"
+                f"选取生效时刻最新的一版；同一生效时刻取最近登记的一版"
+            ),
+        },
         "p95_evaluation": p95_evaluation,
         "status": status,
         "status_label": STATUS_LABELS[status],
@@ -206,15 +258,21 @@ def publish(store: Store, request: PublishIn) -> dict[str, Any]:
     deadline = to_utc_iso(request.deadline)
     if window_start >= window_end:
         raise ValidationProblem("window_start 必须早于 window_end")
-    if request.p95_target_us is not None and not math.isfinite(request.p95_target_us):
-        raise ValidationProblem("p95_target_us 必须是有限数值")
 
     expected = list(request.expected_instances)
     created_at = to_utc_iso(clock.now())
 
     def build(publish_id: int, conn: sqlite3.Connection) -> dict[str, Any]:
-        # Reads run inside the write transaction: the snapshot cannot interleave
-        # with a concurrent report insert.
+        # Target selection and report reads run inside the same write
+        # transaction: a target registered concurrently either commits before
+        # this transaction starts (and is visible) or blocks until it finishes.
+        target = store.effective_p95_target(
+            request.service, window_end, conn=conn
+        )
+        if target is None:
+            # Raising inside the transaction rolls back the publish_id
+            # allocation: no publish record is created for a rejected release.
+            raise NoEligibleTarget(request.service, window_end)
         eligible = store.reports_for_window(
             request.service, window_start, window_end, received_until=deadline, conn=conn
         )
@@ -227,7 +285,7 @@ def publish(store: Store, request: PublishIn) -> dict[str, Any]:
             window_end=window_end,
             deadline=deadline,
             expected=expected,
-            p95_target_us=request.p95_target_us,
+            target=target,
             eligible=eligible,
             all_in_window=all_in_window,
             publish_id=publish_id,
@@ -240,7 +298,7 @@ def publish(store: Store, request: PublishIn) -> dict[str, Any]:
             "window_start": window_start,
             "window_end": window_end,
             "deadline": deadline,
-            "p95_target_us": request.p95_target_us,
+            "p95_target_us": None,
             "created_at": created_at,
         },
         build_result=build,

@@ -6,8 +6,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from app.models import PublishIn
+from app.models import P95TargetIn
 from app.models import ReportIn
-from app.service import ingest_report, publish
+from app.service import ingest_report, publish, register_p95_target
 
 
 def _report(instance: str):
@@ -26,11 +27,19 @@ def _report(instance: str):
     )
 
 
+def _target():
+    return P95TargetIn(
+        service="svc",
+        version="target-v1",
+        p95_target_us=250000,
+        effective_at="2026-11-22T00:00:00Z",
+    )
+
+
 PUBLISH_REQUEST = dict(
     service="svc",
     window_start="2026-11-22T00:00:00Z",
     window_end="2026-11-22T00:05:00Z",
-    p95_target_us=250000,
     expected_instances=["i1", "i2", "i3", "i4"],
     deadline="2026-11-30T00:00:00Z",
 )
@@ -43,6 +52,7 @@ def test_publish_snapshot_is_internally_consistent_under_concurrent_ingest(store
     transaction.  If a publish could observe a partially written report, or a
     counts/total mismatch, this invariant would break.
     """
+    register_p95_target(store, _target())
     request = PublishIn(**PUBLISH_REQUEST)
     errors: list[str] = []
     stop = threading.Event()
@@ -72,9 +82,11 @@ def test_publish_snapshot_is_internally_consistent_under_concurrent_ingest(store
     assert not errors, errors[:5]
     final = publish(store, request)
     assert final["total_count"] == 10 * final["instance_count"]
+    assert final["p95_target_version"] == "target-v1"
 
 
 def test_repeated_publish_is_byte_identical_for_same_deadline(store, fake_clock):
+    register_p95_target(store, _target())
     ingest_report(store, _report("i1"))
     ingest_report(store, _report("i2"))
     request = PublishIn(**{**PUBLISH_REQUEST, "expected_instances": ["i1", "i2"]})
@@ -93,5 +105,27 @@ def test_repeated_publish_is_byte_identical_for_same_deadline(store, fake_clock)
         "missing_instances",
         "reports_used",
         "created_at",
+        "p95_target_version",
+        "p95_target",
     ):
         assert first[key] == second[key], key
+
+
+def test_publish_without_registered_target_rolls_back_and_allocates_no_id(store, fake_clock):
+    from app.service import NoEligibleTarget
+
+    ingest_report(store, _report("i1"))
+    request = PublishIn(**PUBLISH_REQUEST)
+    try:
+        publish(store, request)
+    except NoEligibleTarget:
+        pass
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected NoEligibleTarget")
+
+    # No publish row exists, and after registering a target the first id is 1.
+    assert store.list_publishes() == []
+    register_p95_target(store, _target())
+    result = publish(store, request)
+    assert result["publish_id"] == 1
+    assert result["p95_target_version"] == "target-v1"

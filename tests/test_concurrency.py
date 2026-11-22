@@ -40,13 +40,23 @@ def test_concurrent_identical_posts_insert_once(client):
 
 
 def test_concurrent_publishes_get_unique_increasing_ids(client):
+    register = client.post(
+        "/api/v1/p95-targets",
+        json={
+            "service": "checkout-api",
+            "version": "target-v1",
+            "p95_target_us": 250000,
+            "effective_at": "2026-11-22T00:00:00Z",
+        },
+    )
+    # The autouse default fixture already registered the same version.
+    assert register.status_code in (200, 201)
     for instance in ("checkout-1", "checkout-2"):
         client.post("/api/v1/reports", json=report_payload(instance=instance))
     body = {
         "service": "checkout-api",
         "window_start": "2026-11-22T00:00:00Z",
         "window_end": "2026-11-22T00:05:00Z",
-        "p95_target_us": 250000,
         "expected_instances": ["checkout-1", "checkout-2"],
         "deadline": "2026-11-22T00:07:00Z",
     }
@@ -79,25 +89,48 @@ def test_state_survives_store_reopen(tmp_path):
     settings = Settings(database_path=db_path)
     with TestClient(create_app(settings)) as first_client:
         first_client.post("/api/v1/reports", json=report_payload())
+        target = first_client.post(
+            "/api/v1/p95-targets",
+            json={
+                "service": "checkout-api",
+                "version": "target-v1",
+                "p95_target_us": 250000,
+                "effective_at": "2026-11-22T00:00:00Z",
+            },
+        )
+        assert target.status_code == 201
         publish = first_client.post(
             "/api/v1/publish",
             json={
                 "service": "checkout-api",
                 "window_start": "2026-11-22T00:00:00Z",
                 "window_end": "2026-11-22T00:05:00Z",
-                "p95_target_us": 250000,
                 "expected_instances": ["checkout-1"],
                 "deadline": "2026-11-22T00:07:00Z",
             },
         )
         assert publish.status_code == 201
         snapshot = publish.json()
+        assert snapshot["p95_target_version"] == "target-v1"
 
     with TestClient(create_app(settings)) as second_client:
         reloaded = second_client.get(f"/api/v1/published/{snapshot['publish_id']}")
         assert reloaded.status_code == 200
         assert reloaded.json()["created_at"] == snapshot["created_at"]
         assert reloaded.json()["total_count"] == snapshot["total_count"]
+        assert reloaded.json()["p95_target_version"] == "target-v1"
+        # Registered targets also survive a restart, and re-sending dedupes.
+        again_target = second_client.post(
+            "/api/v1/p95-targets",
+            json={
+                "service": "checkout-api",
+                "version": "target-v1",
+                "p95_target_us": 250000,
+                "effective_at": "2026-11-22T00:00:00Z",
+            },
+        )
+        assert again_target.status_code == 200
+        assert again_target.json()["duplicate"] is True
         # Duplicate detection still works after restart.
         again = second_client.post("/api/v1/reports", json=report_payload())
         assert again.status_code == 200 and again.json()["duplicate"] is True

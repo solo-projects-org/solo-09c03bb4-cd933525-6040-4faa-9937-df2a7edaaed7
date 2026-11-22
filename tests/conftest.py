@@ -52,11 +52,36 @@ def client(tmp_path, fake_clock):
         yield test_client
 
 
+@pytest.fixture(autouse=True)
+def default_target(client):
+    """Most publish tests assume one registered, in-force target version."""
+    response = client.post("/api/v1/p95-targets", json=dict(DEFAULT_TARGET))
+    assert response.status_code == 201
+    return response
+
+
 WINDOW = {
     "service": "checkout-api",
     "window_start": "2026-11-22T00:00:00Z",
     "window_end": "2026-11-22T00:05:00Z",
 }
+
+DEFAULT_TARGET = {
+    "service": "checkout-api",
+    "version": "target-v1",
+    "p95_target_us": 250000,
+    "effective_at": "2026-11-22T00:00:00Z",
+}
+
+
+def target_payload(**overrides):
+    payload = dict(DEFAULT_TARGET)
+    payload.update(overrides)
+    return payload
+
+
+def register_target(client, **overrides):
+    return client.post("/api/v1/p95-targets", json=target_payload(**overrides))
 
 
 def report_payload(instance: str = "checkout-1", **overrides):

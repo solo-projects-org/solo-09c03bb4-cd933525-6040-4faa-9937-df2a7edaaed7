@@ -81,8 +81,73 @@ class ErrorDetail(BaseModel):
     existing_fingerprint: str | None = None
 
 
+class P95TargetIn(BaseModel):
+    """性能数据员登记的一版 p95 目标（按服务、带版本号与 UTC 生效时刻）。
+
+    登记成功的版本不可修改：同 ``(service, version)`` 原样重传返回原版本，
+    内容（目标值或生效时刻）有变则 409 冲突。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "service": "checkout-api",
+                "version": "p95-2026-11-22-r1",
+                "p95_target_us": 250000,
+                "effective_at": "2026-11-22T00:00:00Z",
+            }
+        },
+    )
+
+    service: str = Field(min_length=1, max_length=200, description="被观测 API 服务名")
+    version: str = Field(min_length=1, max_length=200, description="目标版本号，服务内唯一")
+    p95_target_us: float = Field(ge=0, description="p95 SLO 目标（微秒）")
+    effective_at: datetime = Field(description="UTC 生效时刻，带时区，落库归一化为 UTC")
+
+    @field_validator("service", "version")
+    @classmethod
+    def _strip_nonempty(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不得为空白字符串")
+        return stripped
+
+    @field_validator("effective_at")
+    @classmethod
+    def _require_tz(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("时间必须带时区，例如 2026-11-22T00:00:00Z")
+        return value
+
+
+class P95TargetOut(BaseModel):
+    target_id: int
+    duplicate: bool = Field(description="true 表示同版本原样重传，未新增记录")
+    service: str
+    version: str
+    p95_target_us: float | int
+    effective_at: str
+    registered_at: str
+    fingerprint: str
+
+
+class P95TargetSnapshot(BaseModel):
+    """发布时实际采用的 p95 目标版本快照（随发布结果一起持久化）。"""
+
+    version: str = Field(description="采用的目标版本号")
+    p95_target_us: float | int
+    effective_at: str = Field(description="该版本的 UTC 生效时刻")
+    registered_at: str = Field(description="该版本的登记时刻")
+    selection_basis: str = Field(description="选用口径说明")
+
+
 class PublishIn(BaseModel):
-    """按截止时刻发布窗口统计。仅纳入 received_at <= deadline 的上报。"""
+    """按截止时刻发布窗口统计。仅纳入 received_at <= deadline 的上报。
+
+    p95 目标不再由本请求传入：发布时从该服务已登记、且在窗口结束前生效的
+    p95 目标版本中选取最后生效的一版（见 ``POST /api/v1/p95-targets``）。
+    """
 
     model_config = ConfigDict(
         extra="forbid",
@@ -91,7 +156,6 @@ class PublishIn(BaseModel):
                 "service": "checkout-api",
                 "window_start": "2026-11-22T00:00:00Z",
                 "window_end": "2026-11-22T00:05:00Z",
-                "p95_target_us": 250000,
                 "expected_instances": ["checkout-1", "checkout-2", "checkout-3"],
                 "deadline": "2026-11-22T00:07:00Z",
             }
@@ -101,7 +165,6 @@ class PublishIn(BaseModel):
     service: str = Field(min_length=1, max_length=200)
     window_start: datetime
     window_end: datetime
-    p95_target_us: float | None = Field(default=None, ge=0, description="p95 SLO 目标（微秒）")
     expected_instances: list[str] = Field(
         min_length=1, description="应到实例清单，非空、无重复"
     )
@@ -177,7 +240,11 @@ class PublishResult(BaseModel):
     p50: QuantileInterval | None
     p95: QuantileInterval | None
     p99: QuantileInterval | None
-    p95_target_us: float | int | None
+    p95_target_us: float | int
+    p95_target_version: str = Field(description="本次发布采用的 p95 目标版本号")
+    p95_target: P95TargetSnapshot = Field(
+        description="本次发布实际采用的目标版本快照（版本号、目标值、生效与登记时刻）"
+    )
     p95_evaluation: P95Evaluation
     status: Literal["meets", "misses", "pending_review"]
     status_label: str
@@ -191,7 +258,8 @@ class PublishListEntry(BaseModel):
     window_start: str
     window_end: str
     deadline: str
-    p95_target_us: float | None
+    p95_target_us: float | int | None
+    p95_target_version: str | None
     created_at: str
     status: str | None
     missing_instances: list[str]

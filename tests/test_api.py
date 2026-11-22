@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from tests.conftest import WINDOW, report_payload
+from tests.conftest import WINDOW, register_target, report_payload
 
 PUBLISH = {
     **WINDOW,
-    "p95_target_us": 250000,
     "expected_instances": ["checkout-1", "checkout-2"],
     "deadline": "2026-11-22T00:07:00Z",
 }
@@ -25,7 +24,12 @@ def test_health(client):
 def test_openapi_available(client):
     spec = client.get("/openapi.json").json()
     assert spec["openapi"].startswith("3.")
-    for path in ("/api/v1/reports", "/api/v1/publish", "/api/v1/published/{publish_id}"):
+    for path in (
+        "/api/v1/reports",
+        "/api/v1/p95-targets",
+        "/api/v1/publish",
+        "/api/v1/published/{publish_id}",
+    ):
         assert path in spec["paths"]
     assert client.get("/docs").status_code == 200
 
@@ -121,13 +125,19 @@ def test_publish_only_after_deadline_reports(client):
 
 
 def test_publish_meets_when_interval_below_target(client):
+    register_target(client, version="target-150k", p95_target_us=150000)
     post_report(client, instance="checkout-1", bucket_boundaries=[100000], bucket_counts=[10, 0], total_count=10)
     post_report(client, instance="checkout-2", bucket_boundaries=[100000], bucket_counts=[10, 0], total_count=10)
-    body = client.post("/api/v1/publish", json={**PUBLISH, "p95_target_us": 150000}).json()
+    body = client.post("/api/v1/publish", json=PUBLISH).json()
     assert body["p95"]["lower_us"] == 0
     assert body["p95"]["upper_us"] == 100000
     assert body["status"] == "meets"
     assert body["status_label"] == "达标"
+    # The target version actually used travels with the published snapshot.
+    assert body["p95_target_version"] == "target-150k"
+    assert body["p95_target_us"] == 150000
+    assert body["p95_target"]["version"] == "target-150k"
+    assert body["p95_evaluation"]["target_us"] == 150000
 
 
 def test_publish_misses_when_interval_above_target(client):
@@ -140,39 +150,45 @@ def test_publish_misses_when_interval_above_target(client):
             total_count=10,
             total_sum_us=2000000.0,
         )
-    body = client.post("/api/v1/publish", json={**PUBLISH, "p95_target_us": 150000}).json()
+    body = client.post("/api/v1/publish", json=PUBLISH).json()
     # All observations are in (100000,300000]; rank 19/20 still lands there for each instance.
     assert body["p95"]["lower_us"] == 100000
     assert body["p95"]["upper_us"] == 300000
-    # Target lies inside the interval: cannot prove either outcome.
+    # Default target 250000 lies inside the interval: cannot prove either outcome.
     assert body["status"] == "pending_review"
+    assert body["p95_target_version"] == "target-v1"
 
-    below = client.post("/api/v1/publish", json={**PUBLISH, "p95_target_us": 50000}).json()
+    register_target(client, version="target-50k", p95_target_us=50000)
+    below = client.post("/api/v1/publish", json=PUBLISH).json()
     assert below["status"] == "misses"
     assert below["status_label"] == "未达标"
+    assert below["p95_target_version"] == "target-50k"
 
 
 def test_publish_misses_when_lower_bound_exceeds_target(client):
     for instance in ("checkout-1", "checkout-2"):
         post_report(client, instance=instance)
     # Default histogram: p95 rank 139/146 falls in (300000,500000].
-    body = client.post("/api/v1/publish", json={**PUBLISH, "p95_target_us": 250000}).json()
+    body = client.post("/api/v1/publish", json=PUBLISH).json()
     assert body["p95"]["lower_us"] == 300000
     assert body["p95"]["upper_us"] == 500000
     assert body["status"] == "misses"
 
 
 def test_publish_pending_when_target_inside_interval(client):
+    register_target(client, version="target-400k", p95_target_us=400000)
     for instance in ("checkout-1", "checkout-2"):
         post_report(client, instance=instance)
-    body = client.post("/api/v1/publish", json={**PUBLISH, "p95_target_us": 400000}).json()
+    body = client.post("/api/v1/publish", json=PUBLISH).json()
     assert body["p95"]["lower_us"] == 300000
     assert body["p95"]["upper_us"] == 500000
     assert body["status"] == "pending_review"
     assert body["p95_evaluation"]["interval_status"] == "pending_review"
+    assert body["p95_target_version"] == "target-400k"
 
 
 def test_publish_pending_when_p95_in_overflow_bucket(client):
+    register_target(client, version="target-1b", p95_target_us=10**9)
     for instance in ("checkout-1", "checkout-2"):
         post_report(
             client,
@@ -182,12 +198,13 @@ def test_publish_pending_when_p95_in_overflow_bucket(client):
             total_count=10,
             total_sum_us=5000000.0,
         )
-    body = client.post("/api/v1/publish", json={**PUBLISH, "p95_target_us": 10**9}).json()
+    body = client.post("/api/v1/publish", json=PUBLISH).json()
     assert body["p95"]["upper_us"] is None
     assert body["status"] == "pending_review"
 
 
 def test_missing_instances_force_pending_even_if_interval_meets(client):
+    register_target(client, version="target-150k", p95_target_us=150000)
     post_report(
         client,
         instance="checkout-1",
@@ -195,7 +212,7 @@ def test_missing_instances_force_pending_even_if_interval_meets(client):
         bucket_counts=[10, 0],
         total_count=10,
     )
-    body = client.post("/api/v1/publish", json={**PUBLISH, "p95_target_us": 150000}).json()
+    body = client.post("/api/v1/publish", json=PUBLISH).json()
     assert body["status"] == "pending_review"
     assert body["p95_evaluation"]["interval_status"] == "meets"
     assert "checkout-2" in body["missing_instances"]
@@ -255,11 +272,12 @@ def test_unexpected_instance_is_reported_not_merged(client):
 
 
 def test_different_instances_can_use_different_boundaries(client):
+    register_target(client, version="target-100k", p95_target_us=100000)
     post_report(client, instance="checkout-1", bucket_boundaries=[100000, 200000], bucket_counts=[5, 5, 0], total_count=10)
     post_report(client, instance="checkout-2", bucket_boundaries=[150000, 250000], bucket_counts=[3, 4, 3], total_count=10)
     body = client.post(
         "/api/v1/publish",
-        json={**PUBLISH, "expected_instances": ["checkout-1", "checkout-2"], "p95_target_us": 100000},
+        json={**PUBLISH, "expected_instances": ["checkout-1", "checkout-2"]},
     ).json()
     assert body["common_bucket_boundaries"] == [100000, 150000, 200000, 250000]
     # rank 10: at most 8 observations are provably <=100000, so p50 is above it.
@@ -269,6 +287,7 @@ def test_different_instances_can_use_different_boundaries(client):
     assert body["p95"]["lower_us"] == 250000
     assert body["p95"]["upper_us"] is None
     assert body["status"] == "misses"
+    assert body["p95_target_version"] == "target-100k"
 
 
 def test_publish_rejects_invalid_window_and_duplicates(client):
@@ -285,13 +304,74 @@ def test_publish_rejects_invalid_window_and_duplicates(client):
     assert empty_expected.status_code == 422
 
 
-def test_no_target_yields_pending(client):
+def test_publish_no_longer_accepts_target_parameter(client):
+    post_report(client, instance="checkout-1")
+    response = client.post("/api/v1/publish", json={**PUBLISH, "p95_target_us": 250000})
+    assert response.status_code == 422
+
+
+def test_publish_rejected_without_eligible_target_and_no_record_created(client):
+    # A different service has no registered target versions at all.
+    other_window = {
+        "service": "inventory-api",
+        "window_start": "2026-11-22T00:00:00Z",
+        "window_end": "2026-11-22T00:05:00Z",
+        "expected_instances": ["inventory-1"],
+        "deadline": "2026-11-22T00:07:00Z",
+    }
+    response = client.post("/api/v1/publish", json=other_window)
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "no_eligible_p95_target_version"
+    assert "inventory-api" in body["detail"]
+
+    # The rejected release consumed neither a publish record nor an id.
+    assert client.get("/api/v1/published").json() == []
+    post_report(client, instance="checkout-1")
+    accepted = client.post("/api/v1/publish", json=PUBLISH)
+    assert accepted.status_code == 201
+    assert accepted.json()["publish_id"] == 1
+
+
+def test_target_effective_after_window_end_is_not_eligible(client):
+    # Register a version that only becomes effective after the window ends.
+    late = register_target(
+        client,
+        version="target-future",
+        p95_target_us=100000,
+        effective_at="2026-11-22T00:05:01Z",
+    )
+    assert late.status_code == 201
     post_report(client, instance="checkout-1")
     post_report(client, instance="checkout-2")
-    body = client.post("/api/v1/publish", json={**PUBLISH, "p95_target_us": None}).json()
-    assert body["p95"] is not None
-    assert body["status"] == "pending_review"
-    assert body["p95_evaluation"]["reason"] == "未提供 p95 目标"
+    body = client.post("/api/v1/publish", json=PUBLISH)
+    # target-v1 (effective at window start) is still the selected version.
+    assert body.status_code == 201
+    assert body.json()["p95_target_version"] == "target-v1"
+
+
+def test_published_snapshot_carries_target_version_and_verdict(client):
+    post_report(client, instance="checkout-1")
+    post_report(client, instance="checkout-2")
+    created = client.post("/api/v1/publish", json=PUBLISH)
+    assert created.status_code == 201
+    publish_id = created.json()["publish_id"]
+
+    fetched = client.get(f"/api/v1/published/{publish_id}").json()
+    assert fetched["p95_target_version"] == "target-v1"
+    assert fetched["p95_target_us"] == 250000
+    assert fetched["p95_target"] == {
+        "version": "target-v1",
+        "p95_target_us": 250000,
+        "effective_at": "2026-11-22T00:00:00.000000Z",
+        "registered_at": fetched["p95_target"]["registered_at"],
+        "selection_basis": fetched["p95_target"]["selection_basis"],
+    }
+    assert fetched["p95_evaluation"]["status"] == fetched["status"]
+
+    listed = client.get("/api/v1/published").json()
+    assert listed[0]["p95_target_version"] == "target-v1"
+    assert listed[0]["p95_target_us"] == 250000
 
 
 def test_published_not_found(client):

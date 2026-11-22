@@ -49,6 +49,19 @@ CREATE TABLE IF NOT EXISTS publishes (
 CREATE INDEX IF NOT EXISTS idx_publishes_window
     ON publishes (service, window_start, window_end, publish_id);
 
+CREATE TABLE IF NOT EXISTS p95_targets (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    service        TEXT    NOT NULL,
+    version        TEXT    NOT NULL,
+    p95_target_us  REAL    NOT NULL,
+    effective_at   TEXT    NOT NULL,
+    registered_at  TEXT    NOT NULL,
+    fingerprint    TEXT    NOT NULL,
+    UNIQUE (service, version)
+);
+CREATE INDEX IF NOT EXISTS idx_p95_targets_effective
+    ON p95_targets (service, effective_at, id);
+
 CREATE TABLE IF NOT EXISTS seq (
     name  TEXT PRIMARY KEY,
     value INTEGER NOT NULL
@@ -73,6 +86,29 @@ class ReportRow:
     total_sum_us: float
     collected_at: str | None
     received_at: str
+
+
+@dataclass(frozen=True)
+class TargetRow:
+    id: int
+    service: str
+    version: str
+    p95_target_us: float
+    effective_at: str
+    registered_at: str
+    fingerprint: str
+
+
+def _row_to_target(row: sqlite3.Row) -> TargetRow:
+    return TargetRow(
+        id=row["id"],
+        service=row["service"],
+        version=row["version"],
+        p95_target_us=row["p95_target_us"],
+        effective_at=row["effective_at"],
+        registered_at=row["registered_at"],
+        fingerprint=row["fingerprint"],
+    )
 
 
 def _row_to_report(row: sqlite3.Row) -> ReportRow:
@@ -217,6 +253,84 @@ class Store:
             rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_report(row) for row in rows]
 
+    # ---- p95 target versions -----------------------------------------------------
+
+    def record_p95_target(self, values: dict[str, Any]) -> tuple[TargetRow, str]:
+        """Atomically register an immutable p95 target version.
+
+        Keyed by ``(service, version)``.  Returns ``(row, outcome)`` where
+        outcome is ``inserted``, ``duplicate`` (same key, identical canonical
+        fingerprint) or ``conflict`` (same key, different target value or
+        effective time; the registered version is left untouched).
+        """
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM p95_targets WHERE service=? AND version=?",
+                (values["service"], values["version"]),
+            ).fetchone()
+            if existing is not None:
+                row = _row_to_target(existing)
+                if row.fingerprint == values["fingerprint"]:
+                    return row, "duplicate"
+                return row, "conflict"
+            cursor = conn.execute(
+                """INSERT INTO p95_targets
+                   (service, version, p95_target_us, effective_at,
+                    registered_at, fingerprint)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    values["service"],
+                    values["version"],
+                    values["p95_target_us"],
+                    values["effective_at"],
+                    values["registered_at"],
+                    values["fingerprint"],
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM p95_targets WHERE id=?", (cursor.lastrowid,)
+            ).fetchone()
+        return _row_to_target(row), "inserted"
+
+    def list_p95_targets(
+        self, service: str | None = None, limit: int = 200
+    ) -> list[TargetRow]:
+        sql = "SELECT * FROM p95_targets"
+        params: list[Any] = []
+        if service:
+            sql += " WHERE service=?"
+            params.append(service)
+        sql += " ORDER BY service ASC, id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_target(row) for row in rows]
+
+    def effective_p95_target(
+        self,
+        service: str,
+        window_end: str,
+        conn: sqlite3.Connection | None = None,
+    ) -> TargetRow | None:
+        """Return the target version in force at ``window_end``.
+
+        Selection rule: among versions registered for ``service`` whose
+        ``effective_at <= window_end`` (in force when the window closes), take
+        the one with the latest effective time; ties resolve to the most recent
+        registration (largest id), which is the last version that became
+        effective before the window ended.
+        """
+        sql = """SELECT * FROM p95_targets
+                 WHERE service=? AND effective_at <= ?
+                 ORDER BY effective_at DESC, id DESC LIMIT 1"""
+        params = (service, window_end)
+        if conn is not None:
+            row = conn.execute(sql, params).fetchone()
+        else:
+            with self._lock:
+                row = self._conn.execute(sql, params).fetchone()
+        return None if row is None else _row_to_target(row)
+
     # ---- publishes ---------------------------------------------------------------
 
     def insert_publish(
@@ -293,7 +407,8 @@ class Store:
                     "window_start": row["window_start"],
                     "window_end": row["window_end"],
                     "deadline": row["deadline"],
-                    "p95_target_us": row["p95_target_us"],
+                    "p95_target_us": result.get("p95_target_us"),
+                    "p95_target_version": result.get("p95_target_version"),
                     "created_at": row["created_at"],
                     "status": result.get("p95_evaluation", {}).get("status"),
                     "missing_instances": result.get("missing_instances", []),
