@@ -1,0 +1,45 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: slo-latency-aggregator:1.0.0
+    container_name: slo-api
+    ports:
+      - "8000:8000"
+    environment:
+      SLO_DB_PATH: /data/slo.db
+    volumes:
+      - slo-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  # Optional one-shot self-check against a running API.  Not started by default:
+  #   docker compose run --rm selfcheck
+  selfcheck:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: slo-latency-aggregator:1.0.0
+    profiles: ["selfcheck"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      SLO_API_BASE: http://api:8000
+    entrypoint: ["python", "/app/scripts/selfcheck.py"]
+    volumes:
+      - ./scripts:/app/scripts:ro
+    restart: "no"
+
+volumes:
+  slo-data:
